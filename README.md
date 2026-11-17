@@ -172,6 +172,8 @@ Use placeholder values in committed files. Keep real credentials in `.env` local
 
 **Authentication configuration:** `lib/auth.ts` reads `BETTER_AUTH_URL` for the auth base URL. Set it separately in each environment and restart the server after changing it. Register the matching origin and `/api/auth/callback/google` redirect URI in Google OAuth. The browser auth client uses the current application origin.
 
+**Blob authentication:** When `BLOB_READ_WRITE_TOKEN` is configured, chalk passes it explicitly to storage calls so Vercel's automatic OIDC selection cannot override it. Without that token, the SDK uses the connected store's OIDC configuration. Production credentials must refer to the same private store containing the saved narration. After changing Vercel environment variables, redeploy. Storage failures log an operation, error type, and sanitized Blob message under `[lesson-audio]`; credentials are not logged.
+
 The OpenAI provider is called directly through the AI SDK; a Vercel AI Gateway key is not required. Text and speech generation incur provider charges; private audio storage and downloads may incur Blob charges.
 
 ## How to use chalk

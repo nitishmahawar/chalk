@@ -19,7 +19,79 @@ import {
 import { generateLesson } from "./server/generate-lesson";
 import { QueryClient } from "@tanstack/react-query";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { resolve } from "node:path";
 import { fetchSavedNarration } from "./client";
+import { readNarration } from "./server/storage";
+
+test("private narration explicitly uses the read-write token when Vercel OIDC is also present", async (context) => {
+  const requireFromProject = createRequire(resolve("package.json"));
+  // Intercept the Blob SDK's HTTP client, rather than global fetch.
+  const { MockAgent, getGlobalDispatcher, setGlobalDispatcher } = createRequire(
+    requireFromProject.resolve("@vercel/blob"),
+  )("undici");
+  const previousDispatcher = getGlobalDispatcher();
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  setGlobalDispatcher(agent);
+  const names = [
+    "BLOB_READ_WRITE_TOKEN",
+    "BLOB_STORE_ID",
+    "VERCEL_OIDC_TOKEN",
+  ] as const;
+  const previous = names.map((name) => process.env[name]);
+  const token = "vercel_blob_rw_teststore_fakecredential";
+  process.env.BLOB_READ_WRITE_TOKEN = token;
+  process.env.BLOB_STORE_ID = "store_otherstore";
+  process.env.VERCEL_OIDC_TOKEN = `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.fakesignature`;
+  const samples = Buffer.from([0, 0, 1, 0, 255, 127]);
+  const logs: unknown[][] = [];
+  context.mock.method(console, "error", (...args: unknown[]) =>
+    logs.push(args),
+  );
+  try {
+    agent
+      .get("https://teststore.private.blob.vercel-storage.com")
+      .intercept({
+        path: "/lesson.pcm?cache=0",
+        method: "GET",
+        headers: { authorization: `Bearer ${token}` },
+      })
+      .reply(200, samples);
+    const stream = await readNarration("lesson.pcm");
+    assert.deepEqual(
+      Buffer.from(await new Response(stream).arrayBuffer()),
+      samples,
+    );
+    agent
+      .get("https://teststore.private.blob.vercel-storage.com")
+      .intercept({ path: "/denied.pcm?cache=0", method: "GET" })
+      .reply(403, "Forbidden");
+    await assert.rejects(
+      readNarration("denied.pcm"),
+      (error) =>
+        error instanceof Error &&
+        error.message.includes("could not be loaded from storage") &&
+        "status" in error &&
+        error.status === 502,
+    );
+    assert.match(JSON.stringify(logs), /403/);
+    assert.ok(!JSON.stringify(logs).includes(token));
+    agent
+      .get("https://teststore.private.blob.vercel-storage.com")
+      .intercept({ path: "/missing.pcm?cache=0", method: "GET" })
+      .reply(404, "Not found");
+    await assert.rejects(readNarration("missing.pcm"), /could not be found/);
+    agent.assertNoPendingInterceptors();
+  } finally {
+    names.forEach((name, index) => {
+      if (previous[index] === undefined) delete process.env[name];
+      else process.env[name] = previous[index];
+    });
+    setGlobalDispatcher(previousDispatcher);
+    await agent.close();
+  }
+});
 
 test("whiteboard readiness waits for restored elements and the measured embedded viewport", () => {
   const container = { width: 700, height: 400 };
