@@ -1,7 +1,12 @@
 import { z } from "zod";
 import { claimPlan, savePlan, failPlan, getLessonDetail } from "@/db/lessons";
 import { generateLesson } from "@/lib/lesson/server/generate-lesson";
-import { lessonErrorResponse, requireLearner } from "@/lib/lesson/server/http";
+import { requireLessonRateLimit } from "@/lib/lesson/server/rate-limit";
+import {
+  LessonError,
+  lessonErrorResponse,
+  requireLearner,
+} from "@/lib/lesson/server/http";
 export const maxDuration = 180;
 export async function POST(
   request: Request,
@@ -14,6 +19,7 @@ export async function POST(
     const { record, lease } = await claimPlan(owner, id);
     if (lease) {
       claimed = { owner, id, lease };
+      await requireLessonRateLimit(owner, "plan");
       const plan = await generateLesson(record.topic, request.signal);
       await savePlan(owner, id, lease, plan);
     }
@@ -26,7 +32,9 @@ export async function POST(
         claimed.owner,
         claimed.id,
         claimed.lease,
-        "Lesson preparation was interrupted. Please retry.",
+        error instanceof LessonError
+          ? error.message
+          : "Lesson preparation was interrupted. Please retry.",
       ).catch(console.error);
     return lessonErrorResponse(error);
   }

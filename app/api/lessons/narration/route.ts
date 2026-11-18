@@ -7,6 +7,7 @@ import {
   requireLearner,
 } from "@/lib/lesson/server/http";
 import { getAIProvider } from "@/lib/lesson/server/ai";
+import { requireLessonRateLimit } from "@/lib/lesson/server/rate-limit";
 import { claimNarration, saveNarration, failNarration } from "@/db/lessons";
 import {
   requireAudioStorage,
@@ -43,6 +44,7 @@ export async function POST(request: Request) {
         },
       });
     claim = { owner, id: lessonId, segmentId: segment.id, lease };
+    await requireLessonRateLimit(owner, "narration");
     const lesson = record.plan!;
     if (!lesson.steps[step])
       throw new LessonError("This lesson step does not exist.");
@@ -94,7 +96,9 @@ export async function POST(request: Request) {
         claim.id,
         claim.segmentId,
         claim.lease,
-        "Narration was interrupted. Please retry.",
+        error instanceof LessonError
+          ? error.message
+          : "Narration was interrupted. Please retry.",
       ).catch(console.error);
     return lessonErrorResponse(error);
   }

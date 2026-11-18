@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { topicSchema } from "@/lib/lesson/schema";
 import { createSavedLesson, listSavedLessons } from "@/db/lessons";
+import { requireLessonRateLimit } from "@/lib/lesson/server/rate-limit";
 import {
   lessonErrorResponse,
   readBody,
@@ -12,6 +13,7 @@ export async function POST(request: Request) {
     const { topic, requestId } = z
       .object({ topic: topicSchema, requestId: z.uuid() })
       .parse(await readBody(request));
+    await requireLessonRateLimit(owner, "create");
     return Response.json(await createSavedLesson(owner, topic, requestId), {
       headers: { "Cache-Control": "no-store" },
     });

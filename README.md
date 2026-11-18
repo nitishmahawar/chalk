@@ -13,25 +13,27 @@ chalk is an AI whiteboard tutor that turns a topic into a short visual lesson. W
 - Google sign-in, account-specific saved lesson history, saved questions/answers, and playback progress.
 - Recovery of interrupted preparation, reuse of completed narration, and read-only loading of ready lessons.
 - Responsive desktop/mobile navigation and light, dark, and system themes.
+- Shared per-user rate limits backed by Upstash Redis for lesson creation and AI generation.
 
 Lesson plans, narration, and follow-up answers are generated through OpenAI. The whiteboard renders structured scene data and updates with the narration timeline.
 
 ## Technology stack
 
-| Area | Tools |
-| --- | --- |
-| Application | Next.js 16 App Router, React 19, TypeScript |
-| Styling and UI | Tailwind CSS 4, shadcn/ui with Base UI, Lucide icons, next-themes |
-| Server state | TanStack Query 5 for queries, caching, and mutations |
-| Whiteboard | Excalidraw |
-| AI integration | Vercel AI SDK with `@ai-sdk/openai` |
-| Lesson plans and follow-up answers | OpenAI Responses API; default model `gpt-5.4-mini` |
-| Narration | OpenAI `gpt-4o-mini-tts`, `coral` voice |
-| Validation | Zod |
-| Authentication | Better Auth with Google OAuth |
-| Database | PostgreSQL, Drizzle ORM, node-postgres |
-| Audio storage | Private Vercel Blob store |
-| Tests | Node.js test runner through tsx, AI SDK mocks |
+| Area                               | Tools                                                             |
+| ---------------------------------- | ----------------------------------------------------------------- |
+| Application                        | Next.js 16 App Router, React 19, TypeScript                       |
+| Styling and UI                     | Tailwind CSS 4, shadcn/ui with Base UI, Lucide icons, next-themes |
+| Server state                       | TanStack Query 5 for queries, caching, and mutations              |
+| Whiteboard                         | Excalidraw                                                        |
+| AI integration                     | Vercel AI SDK with `@ai-sdk/openai`                               |
+| Lesson plans and follow-up answers | OpenAI Responses API; default model `gpt-5.4-mini`                |
+| Narration                          | OpenAI `gpt-4o-mini-tts`, `coral` voice                           |
+| Validation                         | Zod                                                               |
+| Authentication                     | Better Auth with Google OAuth                                     |
+| Database                           | PostgreSQL, Drizzle ORM, node-postgres                            |
+| Audio storage                      | Private Vercel Blob store                                         |
+| Rate limiting                      | Upstash Redis and `@upstash/ratelimit` sliding windows            |
+| Tests                              | Node.js test runner through tsx, AI SDK mocks                     |
 
 ## Architecture and data flow
 
@@ -40,6 +42,7 @@ flowchart TD
     Learner[Learner enters a topic] --> Client[Next.js workspace / TanStack Query]
     Client --> API[Authenticated route handlers]
     API --> DB[(PostgreSQL: lessons, questions, progress)]
+    API --> Limits[Upstash Redis: per-user rate limits]
     API --> AI[OpenAI: structured plans, speech, answers]
     AI --> API
     API --> Blob[Private Blob: narration segments]
@@ -69,17 +72,17 @@ Reopening a ready lesson retrieves existing narration through read-only endpoint
 
 ### Code organization
 
-| Location | Responsibility |
-| --- | --- |
-| `app/` | Pages, root layout, and API route handlers |
-| `components/workspace/` | Topic input, whiteboard, player, conversation, sidebar |
-| `components/ui/` | Shared shadcn UI primitives |
-| `hooks/` | Preparation, playback, and progress lifecycle |
-| `lib/lesson/` | Lesson validation, audio assembly/timing, board styles, request helpers |
-| `lib/lesson/server/` | AI generation, private audio storage, session/input/error handling |
-| `db/` | Drizzle schema, migrations runner, ownership checks, persistence operations |
-| `drizzle/` | Committed database migrations |
-| `proxy.ts` | Page and API session protection |
+| Location                | Responsibility                                                              |
+| ----------------------- | --------------------------------------------------------------------------- |
+| `app/`                  | Pages, root layout, and API route handlers                                  |
+| `components/workspace/` | Topic input, whiteboard, player, conversation, sidebar                      |
+| `components/ui/`        | Shared shadcn UI primitives                                                 |
+| `hooks/`                | Preparation, playback, and progress lifecycle                               |
+| `lib/lesson/`           | Lesson validation, audio assembly/timing, board styles, request helpers     |
+| `lib/lesson/server/`    | AI generation, private audio storage, session/input/error handling          |
+| `db/`                   | Drizzle schema, migrations runner, ownership checks, persistence operations |
+| `drizzle/`              | Committed database migrations                                               |
+| `proxy.ts`              | Page and API session protection                                             |
 
 Server routes check the authenticated owner before returning lesson data or private audio. Inputs are validated and bounded; errors are sanitized. AI and storage credentials remain server-side. OpenAI text requests disable provider-side response storage; API responses use `Cache-Control: no-store`.
 
@@ -90,14 +93,13 @@ Server routes check the authenticated owner before returning lesson data or priv
 - A Google OAuth client configured for the application origin.
 - An OpenAI API key with access to the configured text and speech models.
 - A **private** Vercel Blob store and its server-side access token.
-
-**Installation note:** `package.json` currently includes a `drizzle-cli` dev dependency referencing a local tarball. Before installing on another machine or deploying, remove or replace that dependency with a portable source and regenerate the lockfile. The schema-generation command uses `drizzle-kit`.
+- An Upstash Redis database with REST URL and token for shared rate limits.
 
 ## Local installation and setup
 
 ### 1. Get the source and install dependencies
 
-Resolve the local dependency reference described above, then install from a checkout:
+Install from a checkout:
 
 ```sh
 git clone <repository-url> chalk
@@ -121,7 +123,7 @@ On macOS/Linux:
 cp .env.example .env
 ```
 
-### 3. Configure Google and private audio storage
+### 3. Configure Google, private audio storage, and Redis
 
 In the Google OAuth client, allow `http://localhost:3000` as the local application origin and add this authorized redirect URI:
 
@@ -130,6 +132,8 @@ http://localhost:3000/api/auth/callback/google
 ```
 
 Create a private Blob store, connect it to the project, and set `BLOB_READ_WRITE_TOKEN`. Public Blob stores are not supported by the narration implementation.
+
+Create an Upstash Redis database and copy its REST credentials to `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`. These are required for lesson creation and new AI generation, including local development. Use a Redis instance near the application region to reduce request latency.
 
 ### 4. Apply database migrations
 
@@ -156,25 +160,44 @@ pnpm start
 
 Use placeholder values in committed files. Keep real credentials in `.env` locally and in the hosting platform's environment settings; never prefix these credentials with `NEXT_PUBLIC_`.
 
-| Variable | Required | Purpose / example |
-| --- | --- | --- |
-| `DATABASE_URL` | Yes | PostgreSQL connection string, such as `postgresql://user:password@localhost:5432/chalk` |
-| `BETTER_AUTH_SECRET` | Yes | A long random authentication secret |
-| `BETTER_AUTH_URL` | Yes | App origin: `http://localhost:3000` locally, or your deployed HTTPS origin in production |
-| `GOOGLE_CLIENT_ID` | Yes | Google OAuth client ID |
-| `GOOGLE_CLIENT_SECRET` | Yes | Google OAuth client secret |
-| `OPENAI_API_KEY` | Yes | Server-only text and speech API credential |
-| `BLOB_READ_WRITE_TOKEN` | Yes for the documented local setup | Token for a private Vercel Blob store |
-| `OPENAI_TEXT_MODEL` | No | Structured-output-capable text model; defaults to `gpt-5.4-mini` |
-| `OPENAI_BASE_URL` | No | Optional provider base URL; defaults to `https://api.openai.com/v1` |
-| `BLOB_STORE_ID` | No when using a Blob token | Store identifier for the alternative Vercel OIDC configuration |
-| `VERCEL_OIDC_TOKEN` | Platform-managed alternative | The storage helper also accepts `BLOB_STORE_ID` together with Vercel's OIDC token instead of a read/write token |
+| Variable                   | Required                           | Purpose / example                                                                                               |
+| -------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`             | Yes                                | PostgreSQL connection string, such as `postgresql://user:password@localhost:5432/chalk`                         |
+| `BETTER_AUTH_SECRET`       | Yes                                | A long random authentication secret                                                                             |
+| `BETTER_AUTH_URL`          | Yes                                | App origin: `http://localhost:3000` locally, or your deployed HTTPS origin in production                        |
+| `GOOGLE_CLIENT_ID`         | Yes                                | Google OAuth client ID                                                                                          |
+| `GOOGLE_CLIENT_SECRET`     | Yes                                | Google OAuth client secret                                                                                      |
+| `OPENAI_API_KEY`           | Yes                                | Server-only text and speech API credential                                                                      |
+| `UPSTASH_REDIS_REST_URL`   | Yes                                | Upstash Redis HTTPS REST endpoint                                                                               |
+| `UPSTASH_REDIS_REST_TOKEN` | Yes                                | Upstash Redis server-only REST access token                                                                     |
+| `BLOB_READ_WRITE_TOKEN`    | Yes for the documented local setup | Token for a private Vercel Blob store                                                                           |
+| `OPENAI_TEXT_MODEL`        | No                                 | Structured-output-capable text model; defaults to `gpt-5.4-mini`                                                |
+| `OPENAI_BASE_URL`          | No                                 | Optional provider base URL; defaults to `https://api.openai.com/v1`                                             |
+| `BLOB_STORE_ID`            | No when using a Blob token         | Store identifier for the alternative Vercel OIDC configuration                                                  |
+| `VERCEL_OIDC_TOKEN`        | Platform-managed alternative       | The storage helper also accepts `BLOB_STORE_ID` together with Vercel's OIDC token instead of a read/write token |
 
 **Authentication configuration:** `lib/auth.ts` reads `BETTER_AUTH_URL` for the auth base URL. Set it separately in each environment and restart the server after changing it. Register the matching origin and `/api/auth/callback/google` redirect URI in Google OAuth. The browser auth client uses the current application origin.
 
 **Blob authentication:** When `BLOB_READ_WRITE_TOKEN` is configured, chalk passes it explicitly to storage calls so Vercel's automatic OIDC selection cannot override it. Without that token, the SDK uses the connected store's OIDC configuration. Production credentials must refer to the same private store containing the saved narration. After changing Vercel environment variables, redeploy. Storage failures log an operation, error type, and sanitized Blob message under `[lesson-audio]`; credentials are not logged.
 
 The OpenAI provider is called directly through the AI SDK; a Vercel AI Gateway key is not required. Text and speech generation incur provider charges; private audio storage and downloads may incur Blob charges.
+
+## Rate limits
+
+Limits use [Upstash sliding windows](https://upstash.com/docs/redis/sdks/ratelimit-ts/gettingstarted), keyed by the authenticated user ID. They are shared across devices and server instances, with separate Redis prefixes for development, preview, and production environments.
+
+| Operation                      | Limit per user per 10 minutes |
+| ------------------------------ | ----------------------------: |
+| Lesson creation requests       |                            10 |
+| New lesson plan attempts       |                             5 |
+| New narration segment attempts |                            90 |
+| New tutor answer attempts      |                            20 |
+
+A lesson has twelve narration segments; each newly generated segment counts separately. Completed plans, cached answers, and saved audio are returned before checking AI quotas. Reading lesson history, reopening ready lessons, polling questions, and saving playback progress do not consume these quotas. Lesson creation requests, including requests that reuse an existing request ID, count toward the creation limit. Failed AI attempts also consume their generation quota.
+
+Exceeding a limit returns HTTP `429` with a `Retry-After` header and a user-facing wait message. The client does not automatically retry a rate-limited generation request. Missing Redis credentials, backend errors, and limiter timeouts return `503` and block new AI calls; rate limiting does not silently fall back to unlimited access. Existing saved content remains readable.
+
+Limits are defined in `lib/lesson/server/rate-limit.ts`. They control request frequency, not a total billing budget; keep provider spending limits configured as well.
 
 ## How to use chalk
 
@@ -192,8 +215,8 @@ Generation progresses while the page is open. Leaving may interrupt pending requ
 
 Deploy chalk to a platform that supports Next.js server routes, such as Vercel:
 
-1. Resolve the machine-local `drizzle-cli` dependency so a clean remote install succeeds.
-2. Configure a hosted PostgreSQL database and a private Blob store accessible from the deployed server.
+1. Verify dependencies install cleanly with `pnpm install --frozen-lockfile`.
+2. Configure a hosted PostgreSQL database, a private Blob store, and Upstash Redis accessible from the deployed server.
 3. Set the required production environment variables, including `BETTER_AUTH_URL=https://<your-domain>`.
 4. Add the production origin and `https://<your-domain>/api/auth/callback/google` to the Google OAuth client configuration.
 5. Apply the committed migrations to the intended production database.
@@ -212,7 +235,7 @@ pnpm lint
 pnpm build
 ```
 
-- `test:core` runs offline with AI SDK mocks and intercepted HTTP requests. It covers structured-output validation/retries, PCM/WAV assembly, timeline boundaries, board readiness, saved-audio caching, and text encoding. It does not call OpenAI, PostgreSQL, or Blob.
+- `test:core` runs offline with AI SDK mocks and intercepted HTTP requests. It covers structured-output validation/retries, PCM/WAV assembly, timeline boundaries, board readiness, saved-audio caching, text encoding, per-user/action rate limits, and fail-closed Redis error/timeout handling. It does not call OpenAI, PostgreSQL, Blob, or live Upstash Redis.
 - `test:db` requires a migrated PostgreSQL database. It creates isolated temporary users and lessons to check ownership, idempotency, lease recovery, saved narration metadata, progress revisions, chat, pagination, and cascade cleanup. It removes its fixtures and does not call OpenAI or Blob.
 - For a manual smoke test, try a math, science, and non-STEM topic. Check visual clarity, factual accuracy, synchronization while seeking, playback controls, follow-up answers, mobile navigation, themes, and saved-lesson reopening. Live generation incurs provider charges.
 
@@ -222,6 +245,6 @@ pnpm build
 - AI-generated facts and diagram layouts can be imperfect and need review. The board supports basic primitives and Unicode equations, without a symbolic mathematics engine.
 - Follow-up answers are text-only and do not change the whiteboard.
 - Cold saved-lesson loading downloads separate PCM segments and assembles a WAV in memory. A combined, directly playable audio file is not currently stored.
-- There is no background generation worker or shared rate limiter. Configure provider spending limits before enabling public access.
+- There is no background generation worker. Rate limits are per account and do not impose a global spending cap; configure provider spending limits before enabling public access.
 - Abrupt browser termination can lose the latest few seconds of playback progress. Browser audio caches do not survive a full refresh.
 - Automatic Blob retention/deletion is not implemented; account or lesson deletion through external administration requires separate audio cleanup.

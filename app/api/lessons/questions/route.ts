@@ -8,6 +8,7 @@ import {
   requireLearner,
 } from "@/lib/lesson/server/http";
 import { getTextModel, textProviderOptions } from "@/lib/lesson/server/ai";
+import { requireLessonRateLimit } from "@/lib/lesson/server/rate-limit";
 import {
   claimQuestion,
   saveAnswer,
@@ -39,6 +40,7 @@ export async function POST(request: Request) {
         headers: { "Cache-Control": "no-store" },
       });
     claim = { id: lessonId, questionId, lease };
+    await requireLessonRateLimit(owner, "question");
     const lesson = record.plan!;
     const model = getTextModel();
     const result = await generateText({
@@ -76,7 +78,9 @@ export async function POST(request: Request) {
         claim.id,
         claim.questionId,
         claim.lease,
-        "The answer was interrupted. Please retry.",
+        error instanceof LessonError
+          ? error.message
+          : "The answer was interrupted. Please retry.",
       ).catch(console.error);
     return lessonErrorResponse(error);
   }

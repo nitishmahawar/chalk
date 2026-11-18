@@ -21,8 +21,113 @@ import { QueryClient } from "@tanstack/react-query";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
-import { fetchSavedNarration } from "./client";
+import { fetchSavedNarration, postLessonRequest } from "./client";
 import { readNarration } from "./server/storage";
+import { requireLessonRateLimit } from "./server/rate-limit";
+import { LessonError } from "./server/errors";
+
+test("Upstash limits are scoped by user and action, and missing or unavailable Redis blocks AI work", async (context) => {
+  const names = ["UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"] as const;
+  const previous = names.map((name) => process.env[name]);
+  const calls: unknown[][] = [];
+  const counts = new Map<string, number>();
+  const logs: unknown[][] = [];
+  let mode: "normal" | "failure" | "timeout" = "normal";
+  let finishSlow: (() => void) | undefined;
+  context.mock.method(console, "error", (...args: unknown[]) =>
+    logs.push(args),
+  );
+  context.mock.method(
+    globalThis,
+    "fetch",
+    async (_url: string, init?: RequestInit) => {
+      const command = JSON.parse(String(init?.body)) as unknown[];
+      calls.push(command);
+      if (mode === "failure") throw new Error("private-upstash-test-token");
+      const respond = () => {
+        const key = String(command[3]);
+        const budget = Number(command[3 + Number(command[2])]);
+        const used = (counts.get(key) ?? 0) + 1;
+        counts.set(key, used);
+        return Response.json({ result: [budget - used, budget] });
+      };
+      if (mode === "timeout")
+        return new Promise<Response>((resolve) => {
+          finishSlow = () => resolve(respond());
+        });
+      return respond();
+    },
+  );
+  try {
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    await assert.rejects(
+      requireLessonRateLimit("learner-a", "plan"),
+      (error) => error instanceof LessonError && error.status === 503,
+    );
+    assert.equal(calls.length, 0);
+    process.env.UPSTASH_REDIS_REST_URL = "https://redis.example.invalid";
+    process.env.UPSTASH_REDIS_REST_TOKEN = "private-upstash-test-token";
+    for (let request = 0; request < 5; request++)
+      await requireLessonRateLimit("learner-a", "plan");
+    await assert.rejects(
+      requireLessonRateLimit("learner-a", "plan"),
+      (error) =>
+        error instanceof LessonError &&
+        error.status === 429 &&
+        (error.retryAfter ?? 0) >= 1,
+    );
+    await requireLessonRateLimit("learner-b", "plan");
+    await requireLessonRateLimit("learner-a", "question");
+    await requireLessonRateLimit("learner-a", "narration");
+    await requireLessonRateLimit("learner-a", "create");
+    assert.ok(
+      calls.some((command) => String(command[3]).includes(":plan:learner-a:")),
+    );
+    assert.ok(
+      calls.some((command) => String(command[3]).includes(":plan:learner-b:")),
+    );
+    assert.deepEqual(
+      calls.slice(-3).map((command) => Number(command[3 + Number(command[2])])),
+      [20, 90, 10],
+    );
+    mode = "failure";
+    const beforeFailure = calls.length;
+    await assert.rejects(
+      requireLessonRateLimit("learner-c", "plan"),
+      (error) => error instanceof LessonError && error.status === 503,
+    );
+    assert.equal(calls.length, beforeFailure + 1);
+    assert.ok(!JSON.stringify(logs).includes("private-upstash-test-token"));
+    mode = "timeout";
+    await assert.rejects(
+      requireLessonRateLimit("learner-c", "plan"),
+      (error) => error instanceof LessonError && error.status === 503,
+    );
+  } finally {
+    finishSlow?.();
+    names.forEach((name, index) => {
+      if (previous[index] === undefined) delete process.env[name];
+      else process.env[name] = previous[index];
+    });
+  }
+});
+
+test("rate-limit responses reach the learner without automatic generation retries", async (context) => {
+  let calls = 0;
+  context.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return Response.json(
+      { error: "Too many requests. Please try again in 30 seconds." },
+      { status: 429, headers: { "Retry-After": "30" } },
+    );
+  });
+  await assert.rejects(
+    postLessonRequest("/api/lessons", {}),
+    /try again in 30 seconds/,
+  );
+  assert.equal(calls, 1);
+});
 
 test("private narration explicitly uses the read-write token when Vercel OIDC is also present", async (context) => {
   const requireFromProject = createRequire(resolve("package.json"));
